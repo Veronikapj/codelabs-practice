@@ -515,7 +515,7 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
             backgroundThread = null
             backgroundHandler = null
             synchronized(lock) {
-                // runDetector = false
+//                runDetector = false
             }
         } catch (e: InterruptedException) {
             Log.e(TAG, "Interrupted when stopping background thread", e)
