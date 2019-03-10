@@ -24,6 +24,7 @@ import android.content.res.Configuration
 import android.graphics.*
 import android.hardware.camera2.*
 import android.hardware.camera2.params.Face
+import android.media.Image
 import android.media.ImageReader
 import android.os.Bundle
 import android.os.Handler
@@ -41,8 +42,17 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
+import com.google.android.gms.tasks.OnFailureListener
+import com.google.firebase.ml.vision.FirebaseVision
+import com.google.firebase.ml.vision.common.FirebaseVisionImage
+import com.google.firebase.ml.vision.common.FirebaseVisionImageMetadata
+import com.google.firebase.ml.vision.face.FirebaseVisionFace
+import com.google.firebase.ml.vision.face.FirebaseVisionFaceDetectorOptions
+import com.google.firebase.ml.vision.face.FirebaseVisionFaceLandmark
 import jeongari.com.lusmile.R
+import java.io.FileNotFoundException
 import java.io.IOException
+import java.nio.ByteBuffer
 import java.util.ArrayList
 import java.util.Arrays
 import java.util.Collections
@@ -60,8 +70,10 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
     private var checkedPermissions = false
     private var textureView: AutoFitTextureView? = null
     private var layoutFrame: AutoFitFrameLayout? = null
-    private var tvState : TextView? = null
-    private var ivState : ImageView? = null
+    private var tvState: TextView? = null
+    private var ivState: ImageView? = null
+
+    private var frameByteArray: ByteArray? = null
 
     private var isFacingFront: Boolean = true
 
@@ -178,6 +190,7 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
      */
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         private fun process(result: CaptureResult) {
+
         }
 
         override fun onCaptureProgressed(
@@ -194,6 +207,18 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
             result: TotalCaptureResult
         ) {
             process(result)
+
+            if (imageReader != null) {
+                val irSurface = imageReader?.surface
+                val request = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                    .apply {
+                        addTarget(irSurface)
+                    }
+                captureSession!!.apply {
+                    this.capture(request.build(), null, null)
+                }
+                irSurface?.release()
+            }
         }
     }
 
@@ -222,7 +247,9 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
     private val periodicClassify = object : Runnable {
         override fun run() {
             synchronized(lock) {
-                // inference
+                if (runDetector) {
+                    detectFace()
+                }
             }
             backgroundHandler!!.post(this)
         }
@@ -295,6 +322,72 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
         startBackgroundThread()
     }
 
+    private fun detectFace() {
+        // Real-time contour detection of multiple faces
+        val options = FirebaseVisionFaceDetectorOptions.Builder()
+            .setClassificationMode(FirebaseVisionFaceDetectorOptions.ACCURATE)
+            .setLandmarkMode(FirebaseVisionFaceDetectorOptions.ALL_LANDMARKS)
+            .setClassificationMode(FirebaseVisionFaceDetectorOptions.ALL_CLASSIFICATIONS)
+            .setMinFaceSize(0.15f)
+            .enableTracking()
+            .build()
+
+        val rotation = activity.windowManager.defaultDisplay.rotation
+
+        val metadata = FirebaseVisionImageMetadata.Builder()
+            .setWidth(480)   // 480x360 is typically sufficient for
+            .setHeight(360)  // image recognition
+            .setFormat(FirebaseVisionImageMetadata.IMAGE_FORMAT_YV12)
+            .setRotation(rotation)
+            .build()
+
+        if (frameByteArray != null) {
+            val image: FirebaseVisionImage = FirebaseVisionImage.fromByteArray(frameByteArray!!, metadata)
+
+            val detector = FirebaseVision.getInstance()
+                .getVisionFaceDetector(options)
+
+            val result = detector.detectInImage(image)
+                .addOnSuccessListener { faces ->
+                    showTextview(faces.size.toString() + " 개의 얼굴 발견")
+                    for (face in faces) {
+                        val bounds = face.boundingBox
+                        val rotY = face.headEulerAngleY  // Head is rotated to the right rotY degrees
+                        val rotZ = face.headEulerAngleZ  // Head is tilted sideways rotZ degrees
+
+                        // If landmark detection was enabled (mouth, ears, eyes, cheeks, and
+                        // nose available):
+                        val leftEar = face.getLandmark(FirebaseVisionFaceLandmark.LEFT_EAR)
+                        leftEar?.let {
+                            val leftEarPos = leftEar.position
+                        }
+
+                        // If classification was enabled:
+                        if (face.smilingProbability != FirebaseVisionFace.UNCOMPUTED_PROBABILITY) {
+                            val smileProb = face.smilingProbability
+                        }
+                        if (face.rightEyeOpenProbability != FirebaseVisionFace.UNCOMPUTED_PROBABILITY) {
+                            val rightEyeOpenProb = face.rightEyeOpenProbability
+                        }
+
+                        // If face tracking was enabled:
+                        if (face.trackingId != FirebaseVisionFace.INVALID_ID) {
+                            val id = face.trackingId
+                        }
+                    }
+                }
+                .addOnFailureListener(
+                    object : OnFailureListener {
+                        override fun onFailure(e: Exception) {
+                            Log.e("OnFailureListener", e.printStackTrace().toString())
+                            // Task failed with an exception
+                            // ...
+                        }
+                    }
+                )
+        }
+    }
+
     override fun onPause() {
         stopBackgroundThread()
         closeCamera()
@@ -337,11 +430,41 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
 
                 // // For still image captures, we use the largest available size.
                 val largest = Collections.max(
-                    Arrays.asList(*map.getOutputSizes(ImageFormat.JPEG)), CompareSizesByArea()
+                    Arrays.asList(*map.getOutputSizes(ImageFormat.YUV_420_888)), CompareSizesByArea()
                 )
+
+                val onImageAvailableListener = object : ImageReader.OnImageAvailableListener {
+                    override fun onImageAvailable(reader: ImageReader) {
+                        val image = reader.acquireLatestImage()
+                        if (image != null) {
+                            val planes = image.planes
+                            if (planes.size >= 3) {
+                                val y = planes[0].buffer
+                                val u = planes[1].buffer
+                                val v = planes[2].buffer
+                                val ly = y.remaining()
+                                val lu = u.remaining()
+                                val lv = v.remaining()
+
+                                val dataYUV = ByteArray(ly + lu + lv)
+
+                                y.get(dataYUV, 0, ly)
+                                u.get(dataYUV, ly, lu)
+                                v.get(dataYUV, ly + lu, lv)
+
+                                frameByteArray = Arrays.copyOf(dataYUV, dataYUV.size-1)
+
+                                image.close()
+                            }
+                        }
+                    }
+                }
+
                 imageReader = ImageReader.newInstance(
-                    largest.width, largest.height, ImageFormat.JPEG, /*maxImages*/ 2
-                )
+                    480, 360, ImageFormat.YUV_420_888, /*maxImages*/ 2
+                ).apply {
+                    setOnImageAvailableListener(onImageAvailableListener, null)
+                }
 
                 // Find out if we need to swap dimension to get the preview size relative to sensor
                 // coordinate.
@@ -391,7 +514,10 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
                     largest
                 )
 
-                Log.d(TAG, "previewSize.width : " + previewSize!!.width + "previewSize.width : " + previewSize!!.height)
+                Log.d(
+                    TAG,
+                    "previewSize.width : " + previewSize!!.width + " previewSize.height : " + previewSize!!.height
+                )
 
                 // We fit the aspect ratio of TextureView to the size of preview we picked.
                 val orientation = resources.configuration.orientation
@@ -500,7 +626,7 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
         backgroundThread!!.start()
         backgroundHandler = Handler(backgroundThread!!.looper)
         synchronized(lock) {
-//            runDetector = true
+            runDetector = true
         }
         backgroundHandler!!.post(periodicClassify)
     }
@@ -515,7 +641,7 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
             backgroundThread = null
             backgroundHandler = null
             synchronized(lock) {
-//                runDetector = false
+                runDetector = false
             }
         } catch (e: InterruptedException) {
             Log.e(TAG, "Interrupted when stopping background thread", e)
@@ -536,13 +662,16 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
             // This is the output Surface we need to start preview.
             val surface = Surface(texture)
 
+
             // We set up a CaptureRequest.Builder with the output Surface.
             previewRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            previewRequestBuilder!!.addTarget(surface)
+                .apply {
+                    addTarget(surface)
+                }
 
             // Here, we create a CameraCaptureSession for camera preview.
             cameraDevice!!.createCaptureSession(
-                Arrays.asList(surface),
+                Arrays.asList(surface, imageReader?.surface),
                 object : CameraCaptureSession.StateCallback() {
 
                     override fun onConfigured(cameraCaptureSession: CameraCaptureSession) {
@@ -559,20 +688,16 @@ class Camera2BasicFragment : Fragment(), ActivityCompat.OnRequestPermissionsResu
                                 CaptureRequest.CONTROL_AF_MODE,
                                 CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
                             )
-                            previewRequestBuilder!!.set(
-                                CaptureRequest.STATISTICS_FACE_DETECT_MODE,
-                                CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL
-                            )
 
                             // Finally, we start displaying the camera preview.
                             previewRequest = previewRequestBuilder!!.build()
-                            captureSession!!.setRepeatingRequest(
-                                previewRequest!!, captureCallback, backgroundHandler
-                            )
+
+                            captureSession!!.apply {
+                                this.setRepeatingRequest(previewRequest!!, captureCallback, backgroundHandler)
+                            }
                         } catch (e: CameraAccessException) {
                             Log.e(TAG, "Failed to set up config to capture Camera", e)
                         }
-
                     }
 
                     override fun onConfigureFailed(cameraCaptureSession: CameraCaptureSession) {
